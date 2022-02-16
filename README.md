@@ -2,12 +2,22 @@
 
 # Overkill Chat
 
-An experimental peer to peer secure chat program written in rust. Uses tor hidden services and noise protocol. This is a learning project to get a better handle on rust and using cryptography libraries. The program has not been audited and I make no guarantees about it's security.
+An experimental peer to peer secure chat program written in rust. Uses tor hidden services and noise protocol. Repository includes both a simple cli interface to the encrypted client program and a gtk gui. 
 
 ## Building 
 
 ```
-cargo build --release 
+make
+```
+
+Build with make, this will generate binaries for the gui and chat client. Chat client 
+requires a rust compiler and gui requires gcc and gtk3 development libraries to build 
+from source. To build either binary individually you can specify the name of the program
+as follows. 
+
+```
+make overkill-chat
+make overkill-gui
 ```
 
 ## Setup
@@ -20,9 +30,34 @@ HiddenServiceDir /home/user/my_hidden_service
 HiddenServicePort 7878 127.0.0.1:7878
 ```
 
+### GUI Setup
+
+To run the gui and connect to a peer you must add their hidden service address to 
+the `overkill-start.sh` script. Change the following line
+
+```
+hservice=peer-hidden-service-address
+```
+
+### Installing
+
+Running make install or the installation script will place the binaries and various
+configuration files in the appropriate directories for most linux distributions. 
+
+```
+make install
+``` 
+
+or 
+
+```
+./install.sh
+```
+
 ## Test Connection 
 
-The program can be run in "echo" mode connecting to itself. Run the following command. If you are using a different hidden service port than the default `7878` set `--port` and `--listen` arguments to your new port.  
+The program can be run in "echo" mode connecting to itself. Run the following command. If you are using a different hidden service port than the default `7878` set `--port` and `--listen` arguments to your new port. Or for the gui perform the same steps in the 
+`overkill-start.sh` script. 
 
 ```
 overkill_chat --host myhiddenservicename.onion
@@ -37,6 +72,8 @@ attempt to connect for n seconds before timing out.
 ```
 overkill_chat --host peershiddenservicename.onion
 ```
+
+For the GUI, simply find 'overkill' in your application menu and run it.
 
 ## Pre-shared Secret 
 

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Encoding=UTF-8
+Version=1.0
+Type=Application
+Terminal=false
+Exec=overkill-start.sh
+Name=Overkill Chat
+Icon=/usr/local/share/overkill/icon.png
