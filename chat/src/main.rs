@@ -1,4 +1,6 @@
 use::std::{io, thread, time, process, num::NonZeroU32};
+use std::sync::mpsc::{Sender, Receiver};
+use std::sync::mpsc;
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream, SocketAddr};
 
@@ -11,51 +13,53 @@ use ring::pbkdf2;
 
 const DEFAULTPORT: &str = "7878";
 const DEFAULTALIAS: &str = "Alice";
-const CONNECTIONTIMEOUT: u32 = 10;
 static NOISEPATTERN: &'static str = "Noise_NN_25519_ChaChaPoly_BLAKE2s";
 static NOISEPATTERNPSK: &'static str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 
-fn accept_connection(port: u16) -> TcpStream {
-    let address: String = format!("{}:{}", "127.0.0.1", port);
-    let listener = TcpListener::bind(address).unwrap();
-    match listener.accept() {
-        Ok((_socket, addr)) => { 
-            println!("new client: {:?}", addr);
-            _socket 
-        }
-        Err(e) => {
-            eprintln!("couldn't get client: {:?}", e);
-            panic!("Listener connection failed!");
-        }
-    }
-}
 
-fn connect(host: &str, port: u16, proxy_port: u16) -> TcpStream {
-    let mut n: u32 = 0;
-    let addr = SocketAddr::from(([127, 0, 0, 1], proxy_port));
+fn connect(host: &str, port: u16, proxy_port: u16, local_port: u16) -> (TcpStream, bool) {
+    let proxy_addr = SocketAddr::from(([127, 0, 0, 1], proxy_port));
+    let local_addr: String = format!("{}:{}", "127.0.0.1", local_port);
+    let listener = TcpListener::bind(local_addr).unwrap();
     
+    // make listener nonblocking
+    listener.set_nonblocking(true).expect("Cannot set non-blocking");
+    
+    // loop forever alternating between listening and attempting 
+    // outgoing connection until one succeeds
     loop {
-        if n > CONNECTIONTIMEOUT {
-            panic!("Outgoing connection timed out")
-        }
-
-        match Socks5Stream::connect(addr, (host, port)) {
+        // listen for incoming
+        for n in 0..100 {
+            match listener.accept() {
+                Ok((_socket, a)) => { 
+                    println!("new client listener: {:?}", a);
+                    return (_socket, false); 
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ;
+                }
+                Err(e) => panic!("encountered IO error: {}", e)
+            }
+            thread::sleep(time::Duration::from_millis(25));
+        }        
+        
+        // try an outgoing connection, blocks
+        match Socks5Stream::connect(proxy_addr, (host, port)) {
             Ok(socks_stream) => {
-                return socks_stream.into_inner();
+                println!("new client outgoing: {:?}", host);
+                return (socks_stream.into_inner(), true);
             }
             Err(e) => {
                 eprintln!("outgoing tcp connection failed: {}", e);
-                thread::sleep(time::Duration::from_secs(1));
             }
         }
-        n += 1;
+        thread::sleep(time::Duration::from_millis(100));
     }
-        
 }
 
 #[inline(always)]
-fn crypto_handshake(mut in_stream: &TcpStream, mut out_stream: &TcpStream, password_used: bool, password: &str) -> 
-    (snow::TransportState, snow::TransportState) {
+fn crypto_handshake(mut stream: &TcpStream, is_initiator: bool, password_used: bool, password: &str) -> 
+    snow::TransportState {
 
     // initiators and responders for snow noise protocol 
     let mut initiator: snow::HandshakeState;
@@ -91,32 +95,35 @@ fn crypto_handshake(mut in_stream: &TcpStream, mut out_stream: &TcpStream, passw
             .build_responder().unwrap();
     }
 
-    // send first part of handshake over our output socket
-    let mut len = initiator.write_message(&[], &mut first_msg).unwrap();
-    out_stream.write(&first_msg[..len]).unwrap();
 
-    // get first part of handshake from peer over input socket
-    len = in_stream.read(&mut first_msg).unwrap();
-    responder.read_message(&first_msg[..len], &mut read_buf).unwrap();
+    if(is_initiator) {
+        // send first part of handshake over our output socket
+        let mut len = initiator.write_message(&[], &mut first_msg).unwrap();
+        stream.write(&first_msg[..len]).unwrap();
 
-    // send response to first message over input socket 
-    len = responder.write_message(&[], &mut second_msg).unwrap();
-    in_stream.write(&second_msg[..len]).unwrap();
+        // listen for response to initial handshake message over output socket 
+        len = stream.read(&mut second_msg).unwrap();
+        initiator.read_message(&second_msg[..len], &mut read_buf).unwrap();
 
-    // listen for response to initial handshake message over output socket 
-    len = out_stream.read(&mut second_msg).unwrap();
-    initiator.read_message(&second_msg[..len], &mut read_buf).unwrap();
+        // NN handshake complete, transition into transport mode.
+        return initiator.into_transport_mode().unwrap();
+    }
+    else {
+        // get first part of handshake from peer over socket
+        let mut len = stream.read(&mut first_msg).unwrap();
+        responder.read_message(&first_msg[..len], &mut read_buf).unwrap();
 
-    // NN handshake complete, transition into transport mode.
-    let initiator = initiator.into_transport_mode().unwrap();
-    let responder = responder.into_transport_mode().unwrap();
+        // send response to first message over input socket 
+        len = responder.write_message(&[], &mut second_msg).unwrap();
+        stream.write(&second_msg[..len]).unwrap();
 
-    return (initiator, responder);
+        // NN handshake complete, transition into transport mode.
+        return responder.into_transport_mode().unwrap();
+    }
 }
 
-fn process_incoming(mut socket: TcpStream, mut responder: snow::TransportState) {
-    let mut net_buffer = [0u8; 1024];
-    let mut out_buffer = [0u8; 1024];
+fn get_incoming(mut socket: TcpStream, sender: mpsc::Sender<([u8; 512], usize)>){
+    let mut net_buffer = [0u8; 512];
     loop {
         match socket.read(&mut net_buffer) {
             Ok(n) => {
@@ -126,70 +133,36 @@ fn process_incoming(mut socket: TcpStream, mut responder: snow::TransportState) 
                     process::exit(0);
                 }
 
-                let n = responder.read_message(&net_buffer[..n], &mut out_buffer).unwrap();
-                
-                // make a string and trim null padding
-                let output = String::from_utf8_lossy(&out_buffer[..n]);
-                let output = output.trim_matches(char::from(0));
-                println!("{}: {}", DEFAULTALIAS, output);
-                
-                // cipher state is updated after successful message receipt to implement 
-                // hash ratchet 
-                responder.rekey_incoming();
+                sender.send( (net_buffer, n) ).unwrap();
 
-                // zero the buffers after every message
+                // zero the buffer after every message
                 net_buffer.fill(0);
-                out_buffer.fill(0);
-
             },
             _ => {
                 // clear buffers if any error occurs 
                 net_buffer.fill(0);
-                out_buffer.fill(0);
-            },
+            }
         }
     }
-}
+} 
 
-#[inline(always)]
-fn get_input(mut socket: TcpStream, mut initiator: snow::TransportState){
+fn get_lines_stdin(sender: mpsc::Sender<[u8; 256]>){
     let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    let mut eof = false;
-    let mut line = String::new();
     let mut line_buffer = [0u8; 256];
-    let mut buf = [0u8; 512];
     
-    // default lines() method reads all lines into heap so we manually 
-    // buffer line by line into one heap allocated string
-    while !eof {
-        match handle.read_line(&mut line){
-            Ok(0) => {
-                eof = true;
+    for line in stdin.lock().lines() {
+        let temp = line.unwrap();
+        let msg_bytes = temp.as_bytes();
+        if msg_bytes.len() > 256 {
+            println!("Message length: {} bytes is over 256 byte limit",
+                msg_bytes.len());
+        }
+        else {
+            for i in 0..msg_bytes.len() {
+                line_buffer[i] = msg_bytes[i];
             }
-            Ok(_) => {
-                line.pop(); // remove newline
-                let msg_bytes = line.as_bytes();
- 
-               if msg_bytes.len() > 256 {
-                    println!("Message length: {} bytes is over 256 byte limit",
-                        msg_bytes.len());
-                }
-                else {
-                    for i in 0..msg_bytes.len() {
-                        line_buffer[i] = msg_bytes[i];
-                    }
-                    let len = initiator.write_message(&line_buffer, &mut buf).unwrap();
-                    socket.write(&buf[..len]).unwrap();
-
-                    // cipher state is updated after successful message send to implement 
-                    // hash ratchet 
-                    initiator.rekey_outgoing();
-                }
-                line.clear(); // reset buffer
-                line_buffer.fill(0);
-            }
-            Err(e) => { panic!("read from stdin failed: {}", e); }
+            sender.send(line_buffer).unwrap();
+            line_buffer.fill(0);
         }
     }
 }
@@ -265,29 +238,75 @@ fn main() {
     };
 
     println!("listen {} port {} address {}", listen, port, host);
-    // start listener for incoming connection
-    let t_join_handle = thread::spawn(move || accept_connection(listen)); 
 
-    // // attempt outgoing connection in main thread
-    let out_stream = connect(host, port, 9050);
+    // attempt outgoing connection in main thread
+    let (mut stream, is_initiator) = connect(host, port, 9050, listen);
 
-    // join listener thread
-    let in_stream: TcpStream = t_join_handle.join().unwrap();
+    println!("local: {:?}", stream.local_addr().unwrap());
+    println!("peer: {:?}", stream.peer_addr().unwrap());
     println!("TCP connection established...");
 
-    // Attempt noise protocol handshake to establish encrypted connection
-    // we are going to need one for incoming connection and one for outgoing
-    // so lets establish a double connection here
-    let (initiator, responder) = crypto_handshake(&in_stream, &out_stream, password_used, &password);
-    println!("Encrypted channel established...");
+    // attempt crypt handshake in main thread
+    let mut crypt = crypto_handshake(&stream, is_initiator, password_used, &password);
+    println!("Encrypted connection established...");
+    println!("Is Initator: {:?}", crypt.is_initiator());
 
-    // get any input from our incoming connection and do stuff with it
-    // in a thread of course 
-    let t_input_listener = thread::spawn( || process_incoming(in_stream, responder));
+    // establish channels
+    let mut stream_clone = stream.try_clone().expect("clone failed...");
+    let (tx_input, rx_input): (Sender<[u8; 256]>, Receiver<[u8; 256]>) = mpsc::channel();
+    let (tx_net, rx_net): (Sender<([u8; 512], usize)>, Receiver<([u8; 512], usize)>) = mpsc::channel();
 
-    // get any new messages from stdin until eof
-    get_input(out_stream, initiator);    
+    // launch threads to get/receive messages
+    let t_input_listener = thread::spawn(move || get_lines_stdin(tx_input));
+    let t_net_listener = thread::spawn(move || get_incoming(stream_clone, tx_net));
 
-    // join listener on close
+    // Main loop for chat service 
+    // - receive encrypted messages from socket 
+    // - receive plaintext from stdin
+    // - encrypt/decrypt with snow transport state
+    // - rekey ciphers to give us a basic single ratchet
+    let mut decrypt_buf = [0u8; 512];
+    let mut encrypt_buf = [0u8; 512];
+    loop{
+        // try input from stdin
+        match rx_input.try_recv() {
+            Ok(val) => {
+                let n = crypt.write_message(&val, &mut encrypt_buf).unwrap();
+                stream.write(&encrypt_buf[..n]).unwrap();
+
+                // update cipherstate after send
+                crypt.rekey_outgoing();
+                // zero buffer after every message
+                encrypt_buf.fill(0);
+            },
+            Err(_e) => {
+            }
+        }
+        // try input from socket 
+        match rx_net.try_recv() {
+            Ok(val) => {
+                let (buf, n) = val;
+                let n = crypt.read_message(&buf[..n], &mut decrypt_buf).unwrap();                                
+                
+                // make a string and trim null padding
+                let output = String::from_utf8_lossy(&decrypt_buf[..n]);
+                let output = output.trim_matches(char::from(0));
+                println!("{}: {}", DEFAULTALIAS, output);
+
+                // update cipherstate after receive
+                crypt.rekey_incoming();
+                // zero buffer after every message
+                decrypt_buf.fill(0);
+            
+            },
+            Err(_e) => {
+            }
+        }
+
+
+    }
+    
+    // join listeners on close
     t_input_listener.join().unwrap();
+    t_net_listener.join().unwrap();
 }
