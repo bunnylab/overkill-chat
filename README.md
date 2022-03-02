@@ -2,7 +2,13 @@
 
 # Overkill Chat
 
-An experimental peer to peer secure chat program written in rust. Uses tor hidden services and noise protocol. Repository includes both a simple cli interface to the encrypted client program and a gtk gui. 
+An experimental peer to peer secure chat program written in rust. Uses tor hidden services and noise protocol. Repository includes both a simple cli interface to the encrypted client program and a gtk gui. Chat program is comparable to [ricochet](https://github.com/blueprint-freespeech/ricochet-refresh). 
+
+## Design 
+- anonymous and metadata resistant communications (tor network)
+- strong end to end message encryption+integrity with [noise protocol](https://github.com/mcginty/snow) 
+- fully p2p architecture, no servers 
+- simple open-source client code in a memory safe language (rust)
 
 ## Building 
 
@@ -52,15 +58,6 @@ or
 
 ```
 ./install.sh
-```
-
-## Test Connection 
-
-The program can be run in "echo" mode connecting to itself. Run the following command. If you are using a different hidden service port than the default `7878` set `--port` and `--listen` arguments to your new port. Or for the gui perform the same steps in the 
-`overkill-start.sh` script. 
-
-```
-overkill_chat --host myhiddenservicename.onion
 ```
 
 ## Connect to Peer 
